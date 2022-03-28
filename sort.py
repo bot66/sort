@@ -51,16 +51,16 @@ def iou_batch(bb_test, bb_gt):
   bb_gt = np.expand_dims(bb_gt, 0)
   bb_test = np.expand_dims(bb_test, 1)
   
-  xx1 = np.maximum(bb_test[..., 0], bb_gt[..., 0])
+  xx1 = np.maximum(bb_test[..., 0], bb_gt[..., 0]) #boardcasting, matrix
   yy1 = np.maximum(bb_test[..., 1], bb_gt[..., 1])
   xx2 = np.minimum(bb_test[..., 2], bb_gt[..., 2])
   yy2 = np.minimum(bb_test[..., 3], bb_gt[..., 3])
   w = np.maximum(0., xx2 - xx1)
   h = np.maximum(0., yy2 - yy1)
-  wh = w * h
+  wh = w * h #intersection
   o = wh / ((bb_test[..., 2] - bb_test[..., 0]) * (bb_test[..., 3] - bb_test[..., 1])                                      
     + (bb_gt[..., 2] - bb_gt[..., 0]) * (bb_gt[..., 3] - bb_gt[..., 1]) - wh)                                              
-  return(o)  
+  return(o)  #bbox mutual iou
 
 
 def convert_bbox_to_z(bbox):
@@ -100,10 +100,19 @@ class KalmanBoxTracker(object):
     """
     Initialises a tracker using initial bounding box.
     """
-    #define constant velocity model
-    self.kf = KalmanFilter(dim_x=7, dim_z=4) 
-    self.kf.F = np.array([[1,0,0,0,1,0,0],[0,1,0,0,0,1,0],[0,0,1,0,0,0,1],[0,0,0,1,0,0,0],  [0,0,0,0,1,0,0],[0,0,0,0,0,1,0],[0,0,0,0,0,0,1]])
-    self.kf.H = np.array([[1,0,0,0,0,0,0],[0,1,0,0,0,0,0],[0,0,1,0,0,0,0],[0,0,0,1,0,0,0]])
+    #define constant velocity model           #from the paper:x = [u, v, s, r, u̇, v̇, ṡ] 
+    self.kf = KalmanFilter(dim_x=7, dim_z=4)  #x:[centre_x,centre_y,w*h,w/h,?,?,?] z:[centre_x,centre_y,w*h,w/h]
+    self.kf.F = np.array([[1,0,0,0,1,0,0],\   
+                          [0,1,0,0,0,1,0],\
+                          [0,0,1,0,0,0,1],\
+                          [0,0,0,1,0,0,0],\
+                          [0,0,0,0,1,0,0],\
+                          [0,0,0,0,0,1,0],\
+                          [0,0,0,0,0,0,1]])
+    self.kf.H = np.array([[1,0,0,0,0,0,0],\
+                          [0,1,0,0,0,0,0],\
+                          [0,0,1,0,0,0,0],\
+                          [0,0,0,1,0,0,0]])
 
     self.kf.R[2:,2:] *= 10.
     self.kf.P[4:,4:] *= 1000. #give high uncertainty to the unobservable initial velocities
@@ -111,7 +120,7 @@ class KalmanBoxTracker(object):
     self.kf.Q[-1,-1] *= 0.01
     self.kf.Q[4:,4:] *= 0.01
 
-    self.kf.x[:4] = convert_bbox_to_z(bbox)
+    self.kf.x[:4] = convert_bbox_to_z(bbox) 
     self.time_since_update = 0
     self.id = KalmanBoxTracker.count
     KalmanBoxTracker.count += 1
@@ -160,7 +169,7 @@ def associate_detections_to_trackers(detections,trackers,iou_threshold = 0.3):
   if(len(trackers)==0):
     return np.empty((0,2),dtype=int), np.arange(len(detections)), np.empty((0,5),dtype=int)
 
-  iou_matrix = iou_batch(detections, trackers)
+  iou_matrix = iou_batch(detections, trackers) #bbox mutual iou
 
   if min(iou_matrix.shape) > 0:
     a = (iou_matrix > iou_threshold).astype(np.int32)
@@ -204,7 +213,7 @@ class Sort(object):
     self.max_age = max_age
     self.min_hits = min_hits
     self.iou_threshold = iou_threshold
-    self.trackers = []
+    self.trackers = [] #kalman trackers (KalmanBoxTracker)
     self.frame_count = 0
 
   def update(self, dets=np.empty((0, 5))):
@@ -221,14 +230,16 @@ class Sort(object):
     trks = np.zeros((len(self.trackers), 5))
     to_del = []
     ret = []
+    #predict
     for t, trk in enumerate(trks):
       pos = self.trackers[t].predict()[0]
       trk[:] = [pos[0], pos[1], pos[2], pos[3], 0]
       if np.any(np.isnan(pos)):
         to_del.append(t)
-    trks = np.ma.compress_rows(np.ma.masked_invalid(trks))
+    trks = np.ma.compress_rows(np.ma.masked_invalid(trks)) #exclude invalid x
     for t in reversed(to_del):
       self.trackers.pop(t)
+    #associate kalman predicted bbox with detections
     matched, unmatched_dets, unmatched_trks = associate_detections_to_trackers(dets,trks, self.iou_threshold)
 
     # update matched trackers with assigned detections
@@ -236,12 +247,14 @@ class Sort(object):
       self.trackers[m[1]].update(dets[m[0], :])
 
     # create and initialise new trackers for unmatched detections
+
+    #create new kalman tracker for unmatched detections(potential new objects)
     for i in unmatched_dets:
-        trk = KalmanBoxTracker(dets[i,:])
+        trk = KalmanBoxTracker(dets[i,:]) #state dim:7 , observe dim 4 
         self.trackers.append(trk)
     i = len(self.trackers)
     for trk in reversed(self.trackers):
-        d = trk.get_state()[0]
+        d = trk.get_state()[0] 
         if (trk.time_since_update < 1) and (trk.hit_streak >= self.min_hits or self.frame_count <= self.min_hits):
           ret.append(np.concatenate((d,[trk.id+1])).reshape(1,-1)) # +1 as MOT benchmark requires positive
         i -= 1
@@ -271,7 +284,9 @@ def parse_args():
 if __name__ == '__main__':
   # all train
   args = parse_args()
-  display = args.display
+  # display = args.display
+  display = True
+
   phase = args.phase
   total_time = 0.0
   total_frames = 0
@@ -287,6 +302,7 @@ if __name__ == '__main__':
   if not os.path.exists('output'):
     os.makedirs('output')
   pattern = os.path.join(args.seq_path, phase, '*', 'det', 'det.txt')
+  #per dataset
   for seq_dets_fn in glob.glob(pattern):
     mot_tracker = Sort(max_age=args.max_age, 
                        min_hits=args.min_hits,
@@ -296,6 +312,7 @@ if __name__ == '__main__':
     
     with open(os.path.join('output', '%s.txt'%(seq)),'w') as out_file:
       print("Processing %s."%(seq))
+      #per frame
       for frame in range(int(seq_dets[:,0].max())):
         frame += 1 #detection and frame numbers begin at 1
         dets = seq_dets[seq_dets[:, 0]==frame, 2:7]
